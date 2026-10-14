@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+# line-scan — token-optimized LINE message scanner for line-cli
+#
+# 三層省 token：
+#   triage   只開 UPDATED 時間有新動態的 chat（一次 line chats 拿全表比對）
+#   watermark 每 chat 記最後訊息 ID，絕不重讀舊訊息（line-cli 讀取不標已讀，
+#            unread_count 永不下降，watermark 是唯一可靠的新訊息訊號）
+#   compact  只留時間/發話人/內文/訊息種類/回覆/解密錯誤
+#
+# 用法：
+#   line-scan                      triage：顯示上次掃描後有新訊息的對話
+#   line-scan --chat NAME          單一對話（name 或 id:xxx）
+#   line-scan --limit N            每對話抓取 N 則（1–100，預設 25）
+#   line-scan --since H            只看 H 小時內有更新的對話
+#   line-scan --all                忽略 watermark（重讀抓取窗內訊息）
+#   line-scan --refresh-names      從 contacts 重建發話人名 cache
+#
+# state: ~/.cache/line-scan/{last_scan,wm/<chatid>,names.json}
+# 環境變數 LINE_SCAN_TZ 可覆寫顯示時區（預設用系統時區）
+#
+# 注意：line CLI 併發會 session 衝突，所有抓取必須序列執行。
+set -u
+if [[ -n "${LINE_SCAN_TZ:-}" ]]; then export TZ="$LINE_SCAN_TZ"; fi
+export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+STATE_DIR="${HOME}/.cache/line-scan"
+WM_DIR="$STATE_DIR/wm"
+NAMES_JSON="$STATE_DIR/names.json"
+LAST_SCAN="$STATE_DIR/last_scan"
+mkdir -p "$WM_DIR"
+
+LIMIT=25
+SINCE_H=""
+CHAT=""
+ALL=0
+REFRESH_NAMES=0
+MODE_SET=0
+
+usage() { sed -n '2,20p' "$0"; }
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --chat) CHAT="${2:?--chat 需要名稱}"; MODE_SET=1; shift 2;;
+        --limit) LIMIT="${2:?}"; MODE_SET=1; shift 2;;
+        --since) SINCE_H="${2:?}"; MODE_SET=1; shift 2;;
+        --all) ALL=1; MODE_SET=1; shift;;
+        --refresh-names) REFRESH_NAMES=1; shift;;
+        -h|--help) usage; exit 0;;
+        *) echo "未知參數: $1" >&2; usage >&2; exit 2;;
+    esac
+done
+
+[[ "$LIMIT" =~ ^[0-9]+$ ]] && (( LIMIT >= 1 && LIMIT <= 100 )) \
+    || { echo "--limit 需為 1–100" >&2; exit 2; }
+
+# ---- keyring / session 環境 ----
+# 若環境已有 DBUS_SESSION_BUS_ADDRESS 就沿用；否則在 Linux 上從
+# gnome-keyring-daemon 的 /proc environ 找回（daemon 重啟後 socket 會變，
+# 不寫死路徑）。macOS 沒有 /proc，走既有環境變數。
+if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" && -d /proc ]]; then
+    for d in /proc/[0-9]*; do
+        if [[ "$(readlink "$d/exe" 2>/dev/null)" == */gnome-keyring-daemon ]]; then
+            BUS="$(tr '\0' '\n' < "$d/environ" 2>/dev/null \
+                | grep -m1 '^DBUS_SESSION_BUS_ADDRESS=' | cut -d= -f2-)"
+            [[ -n "$BUS" ]] && export DBUS_SESSION_BUS_ADDRESS="$BUS"
+            break
+        fi
+    done
+fi
+line whoami >/dev/null 2>&1 || {
+    echo "line 登入失效或 session 不可讀：請先確認 'line whoami' 可用" >&2
+    echo "（Linux：gnome-keyring-daemon 需運行中；重登請跑 'line login'）" >&2
+    exit 1
+}
+
+# ---- names cache ----
+if (( REFRESH_NAMES )); then
+    echo "重建發話人名 cache…" >&2
+    line contacts --json -limit 0 2>/dev/null | jq '
+        map({(.mid): (if .displayNameOverridden != "" and .displayNameOverridden != null
+                      then .displayNameOverridden else .displayName end)})
+        | add // {}' > "$NAMES_JSON.tmp" && mv "$NAMES_JSON.tmp" "$NAMES_JSON"
+    echo "names.json：$(jq 'length' "$NAMES_JSON") 筆" >&2
+    (( MODE_SET == 0 )) && exit 0
+fi
+[[ -f "$NAMES_JSON" ]] || echo '{}' > "$NAMES_JSON"
+
+# ---- chat 列表：line chats -limit 0 --show-ids（human 表格解析） ----
+# 輸出 TSV：chat_id \t name \t type \t updated_epoch
+fetch_chats() {
+    # 注意：mawk 的 {m,} 接字元類別有 bug，這裡避開 interval 語法
+    line chats -limit 0 --show-ids 2>/dev/null | awk '
+        /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]/ {
+            dt = $1 " " $2; tp = $4
+            nm = $0; sub(/^[^ ]+ [^ ]+ +[^ ]+ +[^ ]+ +/, "", nm)
+            pending_dt = dt; pending_tp = tp; pending_nm = nm; next
+        }
+        pending_dt != "" {
+            id = $0; gsub(/^ +| +$/, "", id)
+            if (id ~ /^[A-Za-z0-9_=-]+$/) {
+                cmd = "date -d \"" pending_dt "\" +%s 2>/dev/null"
+                cmd | getline ep; close(cmd)
+                printf "%s\t%s\t%s\t%s\n", id, pending_nm, pending_tp, ep
+            }
+            pending_dt = ""
+        }
+    '
+}
+
+# 訊息 ID 比較（18 位數字字串：先比長度再比字典序，避免 double 精度遺失）
+# 顯示一個 chat 的新訊息；回傳 0=有輸出，1=無新訊息
+show_chat() {
+    local cid="$1" cname="$2" wm new_wm gap
+    wm=""; [[ -f "$WM_DIR/$cid" ]] && wm="$(cat "$WM_DIR/$cid")"
+    local raw
+    raw="$(line messages "$cid" --json -limit "$LIMIT" 2>/dev/null)" || return 1
+    [[ "$raw" == "[]" || -z "$raw" ]] && return 1
+
+    local out
+    out="$(printf '%s' "$raw" | jq \
+        --arg wm "$wm" --arg all "$ALL" --arg limit "$LIMIT" \
+        --slurpfile names "$NAMES_JSON" '
+        def idgt(a;b): (a|length) > (b|length)
+                        or ((a|length) == (b|length) and a > b);
+        def body:
+            if .content_type == 0 then (.text // "")
+            elif .content_type == 1 then "[Image]"
+            elif .content_type == 2 then "[Video]"
+            elif .content_type == 3 then "[Audio]"
+            elif .content_type == 7 then "[Sticker]"
+            elif .content_type == 13 then "[Contact]"
+            elif .content_type == 14 then ("[File: " + (.file_name // "?") + "]")
+            elif .content_type == 22 then "[Rich message]"
+            elif ((.text // "") != "") then .text
+            elif .status == "attachment" then "[Attachment]"
+            elif .status == "unsupported" then "[Unsupported]"
+            else ("[type:" + (.content_type|tostring) + "]")
+            end;
+        def sender:
+            (($names[0][.from]) // null) as $n
+            | if $n != null and $n != "" then $n else .from[0:8] end;
+        def flags:
+            ((if .reply_to != null and .reply_to != "" then " [回覆]" else "" end)
+             + (if .encrypted == true or ((.error // "") != "")
+                then " [解密錯誤]" else "" end));
+        ($wm) as $w
+        | . as $allmsgs
+        | (if $all == "1" or $w == "" then $allmsgs
+           else $allmsgs | map(select(idgt(.id; $w))) end) as $new
+        | {
+            # watermark 掉出抓取窗：抓回來的最舊一則仍比 watermark 新
+            gap: ($w != "" and $all != "1" and ($allmsgs|length) > 0
+                  and idgt($allmsgs[-1].id; $w)),
+            new_wm: (if ($allmsgs|length) > 0 then $allmsgs[0].id else $w end),
+            lines: [$new | reverse | .[]
+                    | ("[" + ((.created_time/1000)|strflocaltime("%m-%d %H:%M")) + "] "
+                       + sender + ": " + body + flags)]
+          }
+    ')"
+    new_wm="$(printf '%s' "$out" | jq -r '.new_wm')"
+    gap="$(printf '%s' "$out" | jq -r '.gap')"
+    local nlines
+    nlines="$(printf '%s' "$out" | jq -r '.lines | length')"
+    if [[ -n "$new_wm" && "$new_wm" != "null" && "$new_wm" != "" ]]; then
+        printf '%s' "$new_wm" > "$WM_DIR/$cid"
+    fi
+    (( nlines == 0 )) && return 1
+    printf '=== %s ===\n' "$cname"
+    [[ "$gap" == "true" ]] && printf '[gap?] watermark 已掉出抓取窗，部分訊息可能遺漏（可用 --limit 調大重抓）\n'
+    printf '%s' "$out" | jq -r '.lines[]'
+    return 0
+}
+
+# ---- 單一 chat 模式 ----
+if [[ -n "$CHAT" ]]; then
+    cid=""; cname=""
+    if [[ "$CHAT" == id:* ]]; then
+        cid="${CHAT#id:}"; cname="$cid"
+    else
+        while IFS=$'\t' read -r id nm tp ep; do
+            if [[ "$nm" == "$CHAT" ]]; then
+                if [[ -n "$cid" ]]; then
+                    echo "名稱 '$CHAT' 對應多個對話，請用 id:xxx 指定" >&2; exit 2
+                fi
+                cid="$id"; cname="$nm"
+            fi
+        done < <(fetch_chats)
+        [[ -z "$cid" ]] && { echo "找不到對話：$CHAT" >&2; exit 2; }
+    fi
+    show_chat "$cid" "$cname" || echo "(無新訊息)"
+    exit 0
+fi
+
+# ---- triage 模式 ----
+now="$(date +%s)"
+cutoff=""
+if [[ -n "$SINCE_H" ]]; then
+    cutoff=$(( now - SINCE_H * 3600 ))
+elif [[ -f "$LAST_SCAN" ]]; then
+    cutoff=$(( $(cat "$LAST_SCAN") - 600 ))   # 10 分鐘重疊，避免邊界遺漏
+else
+    cutoff=$(( now - 24 * 3600 ))
+    echo "首次執行：只看 24 小時內有更新的對話（可用 --since 調整）" >&2
+fi
+
+shown=0
+while IFS=$'\t' read -r id nm tp ep; do
+    [[ -z "$id" || -z "$ep" ]] && continue
+    (( ep < cutoff )) && continue
+    if show_chat "$id" "$nm"; then shown=$((shown+1)); fi
+done < <(fetch_chats)
+
+echo "$now" > "$LAST_SCAN"
+(( shown == 0 )) && echo "(自上次掃描後無新訊息)"
